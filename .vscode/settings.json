@@ -1,0 +1,25 @@
+{
+    "sqltools.connections": [
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "localhost",
+            "port": 5432,
+            "driver": "PostgreSQL",
+            "name": "running_ai",
+            "database": "running_ai",
+            "username": "postgres",
+            "password": "Mp1Z4cD@7"
+        },
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "localhost",
+            "port": 5432,
+            "driver": "PostgreSQL",
+            "name": "running-platform-db",
+            "database": "postgres",
+            "username": "postgres"
+        }
+    ]
+}
