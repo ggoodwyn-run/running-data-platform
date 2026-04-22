@@ -1,54 +1,80 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 from sqlalchemy import MetaData, Table, create_engine
+from sqlalchemy.engine import URL
 from sqlalchemy.dialects.postgresql import insert
+
 
 # ----------------------------
 # Configuration
 # ----------------------------
 
-DATABASE_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/running-platform-db"
-CSV_PATH = "data/garmin_activities.csv"
+connection_url = URL.create(
+    drivername="postgresql+psycopg2",
+    username=os.environ.get("DB_USER", "postgres"),
+    password=os.environ.get("DB_PASSWORD", "Mp1Z4cD@7"),
+    host=os.environ.get("DB_HOST", "localhost"),
+    port=int(os.environ.get("DB_PORT", "5432")),
+    database=os.environ.get("DB_NAME", "postgres"),
+)
+DATABASE_URL = connection_url
+
+# Default resolves relative to this file so the script works from any working directory.
+CSV_PATH = os.environ.get(
+    "ACTIVITIES_CSV_PATH",
+    str(Path(__file__).resolve().parents[2] / "data" / "Activities.csv"),
+)
+
 RAW_SCHEMA = "raw_data"
 RAW_TABLE_NAME = "runs_raw"
 
-# Map normalized source columns -> target database columns
+# Map normalized CSV column names -> database column names
 COLUMN_MAPPING = {
-    "activity_id": "activity_id",
-    "date": "activity_date",
-    "activity_name": "activity_name",
+    "date": "date_of_activity",
+    "title": "title",
     "activity_type": "activity_type",
     "distance": "distance",
     "avg_hr": "avg_hr",
+    "avg_run_cadence": "avg_run_cadence",
     "max_hr": "max_hr",
     "avg_pace": "avg_pace",
     "calories": "calories",
-    "elevation_gain": "elevation_gain_ft",
+    "total_ascent": "total_ascent",
+    "total_descent": "total_descent",
+    "steps": "steps",
+    "avg_stride_length": "avg_stride_length",
 }
 
-# Garmin field that comes in as HH:MM:SS and will become numeric duration fields
+# Garmin time fields (HH:MM:SS) that become decimal-minute columns in the DB
 MOVING_TIME_SOURCE_COLUMN = "moving_time"
+ELAPSED_TIME_SOURCE_COLUMN = "elapsed_time"
 
-REQUIRED_SOURCE_COLUMNS = set(COLUMN_MAPPING.keys()) | {MOVING_TIME_SOURCE_COLUMN}
+REQUIRED_SOURCE_COLUMNS = set(COLUMN_MAPPING.keys()) | {
+    MOVING_TIME_SOURCE_COLUMN,
+    ELAPSED_TIME_SOURCE_COLUMN,
+}
 
 TARGET_COLUMNS = [
-    "activity_id",
-    "activity_date",
-    "activity_name",
+    "date_of_activity",
+    "title",
     "activity_type",
-    "distance_miles",
-    "duration_seconds",
-    "duration_minutes",
+    "distance",
+    "moving_time_minutes",
+    "elapsed_time_minutes",
     "avg_hr",
     "max_hr",
-    "avg_pace_min_per_mile",
+    "avg_run_cadence",
+    "avg_pace",
     "calories",
-    "elevation_gain_ft",
+    "total_ascent",
+    "total_descent",
+    "avg_stride_length",
+    "steps",
     "source_file",
     "record_hash",
 ]
@@ -60,11 +86,8 @@ TARGET_COLUMNS = [
 
 def normalize_column_name(col: str) -> str:
     """
-    Normalize source column names so they are easier to map reliably.
-    Example:
-        'Activity ID' -> 'activity_id'
-        'Avg. HR' -> 'avg_hr'
-        'Moving Time' -> 'moving_time'
+    'Avg. HR' -> 'avg_hr'
+    'Moving Time' -> 'moving_time'
     """
     return (
         col.strip()
@@ -76,61 +99,71 @@ def normalize_column_name(col: str) -> str:
 
 
 def build_record_hash(row: pd.Series) -> str:
-    """
-    Create a deterministic hash for traceability / change detection.
-    Uses stable business fields from the source record.
-    """
+    """Deterministic hash used as the upsert conflict key."""
     parts = [
-        str(row.get("activity_id", "")),
-        str(row.get("activity_date", "")),
-        str(row.get("activity_name", "")),
-        str(row.get("distance_miles", "")),
-        str(row.get("duration_seconds", "")),
+        str(row.get("date_of_activity", "")),
+        str(row.get("title", "")),
+        str(row.get("distance", "")),
+        str(row.get("moving_time_minutes", "")),
     ]
-    raw_string = "|".join(parts)
-    return hashlib.sha256(raw_string.encode("utf-8")).hexdigest()
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def validate_required_columns(df: pd.DataFrame) -> None:
-    actual_columns = set(df.columns)
-    missing = REQUIRED_SOURCE_COLUMNS - actual_columns
+    missing = REQUIRED_SOURCE_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(
             f"Missing expected source columns: {sorted(missing)}. "
-            f"Actual columns found: {sorted(actual_columns)}"
+            f"Actual columns found: {sorted(df.columns)}"
         )
 
 
-def convert_moving_time(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Converts HH:MM:SS moving_time into duration_seconds and duration_minutes.
-    """
-    td = pd.to_timedelta(df[MOVING_TIME_SOURCE_COLUMN], errors="coerce")
+def convert_hhmmss_to_minutes(
+    df: pd.DataFrame, source_col: str, target_col: str
+) -> pd.DataFrame:
+    """Convert a HH:MM:SS column to decimal minutes."""
+    td = pd.to_timedelta(df[source_col], errors="coerce")
+    df[target_col] = (td.dt.total_seconds() / 60).round(2)
+    return df
 
-    df["duration_seconds"] = td.dt.total_seconds()
-    df["duration_minutes"] = (df["duration_seconds"] / 60).round(2)
 
+def convert_avg_pace(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert avg_pace from MM:SS string to decimal minutes. E.g. '7:45' -> 7.75"""
+    def pace_to_decimal(val):
+        if pd.isna(val):
+            return None
+        s = str(val).strip()
+        if ":" in s:
+            parts = s.split(":")
+            try:
+                return round(int(parts[0]) + int(parts[1]) / 60, 2)
+            except (ValueError, IndexError):
+                return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    df["avg_pace"] = df["avg_pace"].apply(pace_to_decimal)
     return df
 
 
 def convert_types(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert source values into clean warehouse-friendly types.
-    """
-    df["activity_id"] = pd.to_numeric(df["activity_id"], errors="coerce").astype("Int64")
-    df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
+    df["date_of_activity"] = pd.to_datetime(df["date_of_activity"], errors="coerce")
 
     numeric_columns = [
-        "distance_miles",
-        "duration_seconds",
-        "duration_minutes",
+        "distance",
+        "moving_time_minutes",
+        "elapsed_time_minutes",
         "avg_hr",
         "max_hr",
-        "avg_pace_min_per_mile",
+        "avg_run_cadence",
+        "avg_stride_length",
         "calories",
-        "elevation_gain_ft",
+        "total_ascent",
+        "total_descent",
+        "steps",
     ]
-
     for col in numeric_columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -138,70 +171,41 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_dataframe(csv_path: str) -> pd.DataFrame:
-    """
-    Read source CSV and return a dataframe aligned to the raw table schema.
-    """
+    """Read source CSV and return a dataframe aligned to the raw table schema."""
     print(f"Reading source file: {csv_path}")
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, thousands=",")
 
-    print("Original columns:")
-    print(df.columns.tolist())
-
-    # Normalize headers first
     df.columns = [normalize_column_name(c) for c in df.columns]
-
-    print("Normalized columns:")
-    print(df.columns.tolist())
-
-    # Validate that the required columns exist before doing anything else
     validate_required_columns(df)
 
-    # Map source columns to warehouse columns
     df = df.rename(columns=COLUMN_MAPPING)
+    df = convert_hhmmss_to_minutes(df, MOVING_TIME_SOURCE_COLUMN, "moving_time_minutes")
+    df = convert_hhmmss_to_minutes(df, ELAPSED_TIME_SOURCE_COLUMN, "elapsed_time_minutes")
 
-    # Convert moving time separately
-    df = convert_moving_time(df)
-
-    # Keep only mapped/target columns plus source-derived metadata later
-    keep_columns = list(COLUMN_MAPPING.values()) + ["duration_seconds", "duration_minutes"]
+    keep_columns = list(COLUMN_MAPPING.values()) + ["moving_time_minutes", "elapsed_time_minutes"]
     df = df[keep_columns].copy()
 
-    # Convert types
+    df = convert_avg_pace(df)
     df = convert_types(df)
 
-    # Add metadata fields
     df["source_file"] = Path(csv_path).name
     df["record_hash"] = df.apply(build_record_hash, axis=1)
 
-    # Reorder to match the target raw table
     df = df[TARGET_COLUMNS]
 
-    # Optional: drop rows with null activity_id because that's your business key
-    before_drop = len(df)
-    df = df.dropna(subset=["activity_id"]).copy()
-    after_drop = len(df)
-
-    if before_drop != after_drop:
-        print(f"Dropped {before_drop - after_drop} rows due to null activity_id")
-
-    # Convert pandas nullable integer to plain Python int where possible
-    df["activity_id"] = df["activity_id"].astype("int64")
-
     print(f"Prepared {len(df)} rows for loading")
-    print("Preview:")
     print(df.head())
-
     return df
 
 
 def upsert_raw_runs(df: pd.DataFrame) -> None:
-    """
-    Upsert rows into raw.runs_raw using activity_id as the business key.
-    """
+    """Upsert rows into raw_data.runs_raw using record_hash as the conflict key."""
     engine = create_engine(DATABASE_URL, future=True)
     metadata = MetaData(schema=RAW_SCHEMA)
     runs_raw = Table(RAW_TABLE_NAME, metadata, autoload_with=engine)
 
+    # Replace NaN with None so PostgreSQL receives NULL instead of NaN
+    df = df.where(df.notna(), None)
     rows = df.to_dict(orient="records")
 
     if not rows:
@@ -212,21 +216,24 @@ def upsert_raw_runs(df: pd.DataFrame) -> None:
         for row in rows:
             stmt = insert(runs_raw).values(**row)
             stmt = stmt.on_conflict_do_update(
-                index_elements=["activity_id"],
+                index_elements=["record_hash"],
                 set_={
-                    "activity_date": stmt.excluded.activity_date,
-                    "activity_name": stmt.excluded.activity_name,
+                    "date_of_activity": stmt.excluded.date_of_activity,
+                    "title": stmt.excluded.title,
                     "activity_type": stmt.excluded.activity_type,
-                    "distance_miles": stmt.excluded.distance_miles,
-                    "duration_seconds": stmt.excluded.duration_seconds,
-                    "duration_minutes": stmt.excluded.duration_minutes,
+                    "distance": stmt.excluded.distance,
+                    "moving_time_minutes": stmt.excluded.moving_time_minutes,
+                    "elapsed_time_minutes": stmt.excluded.elapsed_time_minutes,
                     "avg_hr": stmt.excluded.avg_hr,
                     "max_hr": stmt.excluded.max_hr,
-                    "avg_pace_min_per_mile": stmt.excluded.avg_pace_min_per_mile,
+                    "avg_run_cadence": stmt.excluded.avg_run_cadence,
+                    "avg_pace": stmt.excluded.avg_pace,
                     "calories": stmt.excluded.calories,
-                    "elevation_gain_ft": stmt.excluded.elevation_gain_ft,
+                    "total_ascent": stmt.excluded.total_ascent,
+                    "total_descent": stmt.excluded.total_descent,
+                    "avg_stride_length": stmt.excluded.avg_stride_length,
+                    "steps": stmt.excluded.steps,
                     "source_file": stmt.excluded.source_file,
-                    "record_hash": stmt.excluded.record_hash,
                 },
             )
             conn.execute(stmt)
